@@ -16,6 +16,21 @@ async function fetchElement(path) {
   return res.json();
 }
 
+async function mutateElement(method, path, body) {
+  const opts = {
+    method,
+    signal: AbortSignal.timeout(5000),
+    headers: { "Content-Type": "application/json" },
+  };
+  if (body) opts.body = JSON.stringify(body);
+  const res = await fetch(`${ELEMENT_API}${path}`, opts);
+  const json = await res.json();
+  if (!res.ok) {
+    throw new Error(json.error || `Element API ${method} ${path} returned ${res.status}`);
+  }
+  return json;
+}
+
 function textResult(content) {
   return { content: [{ type: "text", text: content }] };
 }
@@ -68,7 +83,7 @@ function buildElementPrompt(data, instruction) {
 
 const server = new McpServer({
   name: "element",
-  version: "1.1.0",
+  version: "1.2.0",
 });
 
 // ─── Prompt: element (slash command) ────────────────────────────────────────
@@ -314,12 +329,146 @@ server.tool(
   }
 );
 
+// ─── Tool: add_project ──────────────────────────────────────────────────────
+
+server.tool(
+  "add_project",
+  "Add a new project to the Element inspector app. This lets Element know about your project so it can preview it and inspect UI elements.",
+  {
+    name: z.string().describe("Project name (e.g., 'My App')"),
+    path: z.string().describe("Absolute path to the project directory"),
+    platform: z
+      .enum(["web", "reactNative", "swiftUI", "uiKit"])
+      .describe("Platform type"),
+    url: z
+      .string()
+      .optional()
+      .describe("Preview URL (e.g., 'http://localhost:3000')"),
+    port: z.number().optional().describe("Dev server port (e.g., 3000)"),
+  },
+  async ({ name, path, platform, url, port }) => {
+    try {
+      const result = await mutateElement("POST", "/projects", {
+        name,
+        path,
+        platform,
+        url,
+        port,
+      });
+      return textResult(
+        `Project added successfully.\n- Name: ${result.name}\n- ID: ${result.id}`
+      );
+    } catch (error) {
+      return textResult(`Failed to add project: ${error.message}`);
+    }
+  }
+);
+
+// ─── Tool: remove_project ───────────────────────────────────────────────────
+
+server.tool(
+  "remove_project",
+  "Remove a project from the Element inspector app by its ID. Also stops any running dev server for that project.",
+  {
+    project_id: z
+      .string()
+      .describe("UUID of the project to remove (from get_projects)"),
+  },
+  async ({ project_id }) => {
+    try {
+      await mutateElement("DELETE", `/projects/${project_id}`);
+      return textResult(`Project ${project_id} removed successfully.`);
+    } catch (error) {
+      return textResult(`Failed to remove project: ${error.message}`);
+    }
+  }
+);
+
+// ─── Tool: start_dev_server ─────────────────────────────────────────────────
+
+server.tool(
+  "start_dev_server",
+  "Start the dev server for a project in the Element app. If no project_id is given, starts the server for the currently selected project.",
+  {
+    project_id: z
+      .string()
+      .optional()
+      .describe(
+        "UUID of the project (optional — defaults to selected project)"
+      ),
+  },
+  async ({ project_id }) => {
+    try {
+      const body = project_id ? { project_id } : {};
+      const result = await mutateElement("POST", "/dev-server/start", body);
+      return textResult(
+        `Dev server started for "${result.project}".\n- Command: ${result.command}`
+      );
+    } catch (error) {
+      return textResult(`Failed to start dev server: ${error.message}`);
+    }
+  }
+);
+
+// ─── Tool: stop_dev_server ──────────────────────────────────────────────────
+
+server.tool(
+  "stop_dev_server",
+  "Stop the dev server for a project in the Element app. If no project_id is given, stops the server for the currently selected project.",
+  {
+    project_id: z
+      .string()
+      .optional()
+      .describe(
+        "UUID of the project (optional — defaults to selected project)"
+      ),
+  },
+  async ({ project_id }) => {
+    try {
+      const body = project_id ? { project_id } : {};
+      const result = await mutateElement("POST", "/dev-server/stop", body);
+      return textResult(`Dev server stopped for "${result.project}".`);
+    } catch (error) {
+      return textResult(`Failed to stop dev server: ${error.message}`);
+    }
+  }
+);
+
+// ─── Tool: get_dev_server_status ────────────────────────────────────────────
+
+server.tool(
+  "get_dev_server_status",
+  "Get the status of all running dev servers managed by the Element app.",
+  {},
+  async () => {
+    try {
+      const data = await fetchElement("/dev-server/status");
+
+      if (!data.servers || data.servers.length === 0) {
+        return textResult("No dev servers are currently running.");
+      }
+
+      const lines = [`## Running Dev Servers`, ``];
+      for (const s of data.servers) {
+        lines.push(
+          `- **${s.project_name}** — \`${s.command}\` (running: ${s.running})`
+        );
+        lines.push(`  ID: ${s.project_id} | Started: ${s.started_at}`);
+      }
+
+      return textResult(lines.join("\n"));
+    } catch (error) {
+      return textResult(`Failed to get dev server status: ${error.message}`);
+    }
+  }
+);
+
 // ─── Start Server ───────────────────────────────────────────────────────────
 
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  process.stderr.write("[element-mcp] Server running on stdio (v1.1.0)\n");
+  process.stderr.write("[element-mcp] Server running on stdio (v1.2.0)\n");
 }
 
 main().catch((err) => {

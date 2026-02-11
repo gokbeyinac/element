@@ -9,11 +9,13 @@ final class ElementAPIServer: ObservableObject {
 
     private var listener: NWListener?
     private weak var appState: AppState?
+    private weak var devServerManager: DevServerManager?
 
     static let port: UInt16 = 7749
 
-    func start(appState: AppState) {
+    func start(appState: AppState, devServerManager: DevServerManager) {
         self.appState = appState
+        self.devServerManager = devServerManager
 
         do {
             let params = NWParameters.tcp
@@ -87,23 +89,44 @@ final class ElementAPIServer: ObservableObject {
     @MainActor
     private func routeRequest(_ raw: String, connection: NWConnection) {
         let (method, path) = parseRequestLine(raw)
+        let body = parseRequestBody(raw)
 
-        let responseJSON: String
         switch (method, path) {
         case ("GET", "/health"):
-            responseJSON = healthResponse()
+            sendResponse(connection: connection, status: 200, body: healthResponse())
         case ("GET", "/selection"):
-            responseJSON = selectionResponse()
+            sendResponse(connection: connection, status: 200, body: selectionResponse())
         case ("GET", "/context"):
-            responseJSON = contextResponse()
+            sendResponse(connection: connection, status: 200, body: contextResponse())
         case ("GET", "/projects"):
-            responseJSON = projectsResponse()
+            sendResponse(connection: connection, status: 200, body: projectsResponse())
+
+        // Project management
+        case ("POST", "/projects"):
+            let (status, json) = addProjectHandler(body: body)
+            sendResponse(connection: connection, status: status, body: json)
+        case ("DELETE", _) where path.hasPrefix("/projects/"):
+            let idString = String(path.dropFirst("/projects/".count))
+            let (status, json) = removeProjectHandler(idString: idString)
+            sendResponse(connection: connection, status: status, body: json)
+
+        // Dev server management
+        case ("POST", "/dev-server/start"):
+            let (status, json) = startDevServerHandler(body: body)
+            sendResponse(connection: connection, status: status, body: json)
+        case ("POST", "/dev-server/stop"):
+            let (status, json) = stopDevServerHandler(body: body)
+            sendResponse(connection: connection, status: status, body: json)
+        case ("GET", "/dev-server/status"):
+            sendResponse(connection: connection, status: 200, body: devServerStatusResponse())
+
+        // CORS preflight
+        case ("OPTIONS", _):
+            sendResponse(connection: connection, status: 200, body: #"{"ok":true}"#)
+
         default:
             sendResponse(connection: connection, status: 404, body: #"{"error":"not_found"}"#)
-            return
         }
-
-        sendResponse(connection: connection, status: 200, body: responseJSON)
     }
 
     // MARK: - Route Handlers
@@ -186,6 +209,136 @@ final class ElementAPIServer: ObservableObject {
         return json
     }
 
+    // MARK: - Project Management Handlers
+
+    @MainActor
+    private func addProjectHandler(body: String?) -> (Int, String) {
+        guard let state = appState else {
+            return (500, #"{"error":"no_state"}"#)
+        }
+
+        guard let body,
+              let data = body.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(AddProjectPayload.self, from: data) else {
+            return (400, #"{"error":"invalid_body","message":"Expected JSON with name, path, platform, url fields"}"#)
+        }
+
+        let platformType: PlatformType
+        switch payload.platform.lowercased() {
+        case "web": platformType = .web
+        case "reactnative", "react-native", "react_native": platformType = .reactNative
+        case "swiftui", "swift-ui", "swift_ui": platformType = .swiftUI
+        case "uikit", "ui-kit", "ui_kit": platformType = .uiKit
+        default:
+            return (400, #"{"error":"invalid_platform","message":"Platform must be: web, reactNative, swiftUI, or uiKit"}"#)
+        }
+
+        let project = ProjectConfig(
+            id: UUID(),
+            name: payload.name,
+            path: payload.path,
+            platform: platformType,
+            url: payload.url ?? "",
+            port: payload.port
+        )
+
+        state.addProject(project)
+        return (201, #"{"success":true,"id":"\#(project.id.uuidString)","name":"\#(project.name)"}"#)
+    }
+
+    @MainActor
+    private func removeProjectHandler(idString: String) -> (Int, String) {
+        guard let state = appState else {
+            return (500, #"{"error":"no_state"}"#)
+        }
+
+        guard let uuid = UUID(uuidString: idString) else {
+            return (400, #"{"error":"invalid_id"}"#)
+        }
+
+        guard state.projects.contains(where: { $0.id == uuid }) else {
+            return (404, #"{"error":"project_not_found"}"#)
+        }
+
+        devServerManager?.stop(projectID: uuid)
+        state.removeProject(id: uuid)
+        return (200, #"{"success":true}"#)
+    }
+
+    // MARK: - Dev Server Handlers
+
+    @MainActor
+    private func startDevServerHandler(body: String?) -> (Int, String) {
+        guard let state = appState, let dsm = devServerManager else {
+            return (500, #"{"error":"no_state"}"#)
+        }
+
+        // If body has project_id, use that; otherwise use selected project
+        let project: ProjectConfig?
+        if let body, let data = body.data(using: .utf8),
+           let payload = try? JSONDecoder().decode(DevServerPayload.self, from: data),
+           let id = UUID(uuidString: payload.project_id ?? "") {
+            project = state.projects.first { $0.id == id }
+        } else {
+            project = state.selectedProject
+        }
+
+        guard let proj = project else {
+            return (400, #"{"error":"no_project","message":"No project selected or found"}"#)
+        }
+
+        dsm.start(project: proj)
+        return (200, #"{"success":true,"project":"\#(proj.name)","command":"\#(DevServerManager.inferCommand(from: proj.url))"}"#)
+    }
+
+    @MainActor
+    private func stopDevServerHandler(body: String?) -> (Int, String) {
+        guard let state = appState, let dsm = devServerManager else {
+            return (500, #"{"error":"no_state"}"#)
+        }
+
+        let project: ProjectConfig?
+        if let body, let data = body.data(using: .utf8),
+           let payload = try? JSONDecoder().decode(DevServerPayload.self, from: data),
+           let id = UUID(uuidString: payload.project_id ?? "") {
+            project = state.projects.first { $0.id == id }
+        } else {
+            project = state.selectedProject
+        }
+
+        guard let proj = project else {
+            return (400, #"{"error":"no_project","message":"No project selected or found"}"#)
+        }
+
+        dsm.stop(projectID: proj.id)
+        return (200, #"{"success":true,"project":"\#(proj.name)"}"#)
+    }
+
+    @MainActor
+    private func devServerStatusResponse() -> String {
+        guard let state = appState, let dsm = devServerManager else {
+            return #"{"servers":[]}"#
+        }
+
+        var servers: [[String: Any]] = []
+        for (projectID, serverProcess) in dsm.runningServers {
+            let projectName = state.projects.first(where: { $0.id == projectID })?.name ?? "unknown"
+            servers.append([
+                "project_id": projectID.uuidString,
+                "project_name": projectName,
+                "command": serverProcess.command,
+                "running": serverProcess.process.isRunning,
+                "started_at": ISO8601DateFormatter().string(from: serverProcess.startedAt)
+            ])
+        }
+
+        guard let data = try? JSONSerialization.data(withJSONObject: ["servers": servers]),
+              let json = String(data: data, encoding: .utf8) else {
+            return #"{"servers":[]}"#
+        }
+        return json
+    }
+
     // MARK: - HTTP Helpers
 
     private func parseRequestLine(_ raw: String) -> (String, String) {
@@ -195,11 +348,27 @@ final class ElementAPIServer: ObservableObject {
         return (String(parts[0]), String(parts[1]))
     }
 
+    private func parseRequestBody(_ raw: String) -> String? {
+        // HTTP body comes after double CRLF
+        if let range = raw.range(of: "\r\n\r\n") {
+            let body = String(raw[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            return body.isEmpty ? nil : body
+        }
+        if let range = raw.range(of: "\n\n") {
+            let body = String(raw[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            return body.isEmpty ? nil : body
+        }
+        return nil
+    }
+
     private func sendResponse(connection: NWConnection, status: Int, body: String) {
         let statusText: String
         switch status {
         case 200: statusText = "OK"
+        case 201: statusText = "Created"
+        case 400: statusText = "Bad Request"
         case 404: statusText = "Not Found"
+        case 500: statusText = "Internal Server Error"
         default: statusText = "Error"
         }
 
@@ -292,4 +461,16 @@ private struct ProjectPayload: Encodable {
 
 private struct ProjectsPayload: Encodable {
     let projects: [ProjectPayload]
+}
+
+private struct AddProjectPayload: Decodable {
+    let name: String
+    let path: String
+    let platform: String
+    let url: String?
+    let port: Int?
+}
+
+private struct DevServerPayload: Decodable {
+    let project_id: String?
 }

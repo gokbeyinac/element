@@ -18,7 +18,7 @@ struct ElementApp: App {
                 .onAppear {
                     appState.loadProjects()
                     checkAccessibilityPermission()
-                    apiServer.start(appState: appState)
+                    apiServer.start(appState: appState, devServerManager: devServerManager)
                     // Auto-start Claude session for the initial project
                     startClaudeSessionIfNeeded()
                 }
